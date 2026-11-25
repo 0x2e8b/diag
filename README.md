@@ -1,8 +1,8 @@
 # diag - packet capture host toolkit
 
-Three bash scripts for a Linux host that captures mirrored (SPAN/TAP) traffic with
+Four bash scripts for a Linux host that captures mirrored (SPAN/TAP) traffic with
 PF_RING, n2disk and nProbe: find out **why packets are lost**, **tune the capture NICs**
-and **find duplicated packets or loops** in the mirror.
+**fit the host for capture** and **find duplicated packets or loops** in the mirror.
 
 Made to be typed by hand over a screen share: short commands, one screen of output,
 no dependencies beyond `bash`, `ethtool`, `iproute2`, `tcpdump` (and optionally `perf`).
@@ -12,16 +12,19 @@ sudo su -
 git clone https://github.com/0x2e8b/diag && cd diag
 bash diag.sh          # 1. what is wrong (read-only)
 bash nic.sh           # 2. tune the NICs (interactive, reversible)
-bash dup.sh eno1np0   # 3. duplicates / loops on one NIC
+bash capfit.sh        # 3. offloads, kernel, priorities (asks before every change, reversible)
+bash dup.sh eno1np0   # 4. duplicates / loops on one NIC
 ```
 
 | Script | Changes the system? | Use it for |
 |---|---|---|
 | `diag.sh` | no, read-only | full diagnosis with findings and proposed fixes |
 | `nic.sh` | yes, only after you confirm; `revert` undoes it | RX ring, queues, IRQ placement, RSS, persistence |
+| `capfit.sh` | yes, one question per change; `revert` undoes it | NIC features that alter packets (GRO/LRO/TSO/GSO, VLAN stripping), kernel buffers and disk write-back, n2disk/nprobe priority |
 | `dup.sh` | no (a short `tcpdump`) | duplicated packets, L2/L3 loops, broadcast storms |
 
 Start with `diag.sh`. It tells you whether `nic.sh` will help at all.
+`capfit.sh` is worth running on every capture host: VLAN stripping and GRO change what is recorded, not only how fast.
 
 ---
 
@@ -158,6 +161,87 @@ Q=12 RESERVE=4 NICS="eno1np0" bash nic.sh apply
 
 `apply`, `rss` and `revert` reset the NIC link for a few seconds, so the capture
 applications lose a few seconds of traffic. Run them in an agreed window.
+
+---
+
+## capfit.sh - fit the host for capture
+
+`nic.sh` decides **how fast** the NIC hands packets to the host. `capfit.sh` covers three other things:
+
+- **what the NIC does to the packets**;
+- **kernel settings**;
+- **priority of the capture applications**.
+
+It is interactive and asks **before every single change**, with one line saying why.
+So you can, for example, turn off GRO but keep VLAN stripping when the customer
+wants it that way.
+
+```
+bash capfit.sh
+```
+
+```
+ 1 check     what is not capture-friendly (changes nothing)
+ 2 offloads  NIC: GRO/LRO/TSO/GSO, VLAN stripping   (asks for each; link may blink)
+ 3 kernel    backlog, socket buffers, steady disk write-back, swappiness
+ 4 priority  n2disk/nprobe: nice, OOM protection, locked memory (live + drop-in, no restart)
+ 5 all       2 + 3 + 4, still one question per change
+ 6 persist   the offloads you turned off, again after reboot
+ 7 revert    everything back to the original
+```
+
+`check` prints one table with the current value, the recommended value and the status
+(`OK`, `CHANGE`, `cannot change (driver)`) for each item.
+
+**NIC features** (recommended: off on a capture NIC):
+
+| Feature | Why it matters |
+|---|---|
+| `gro` | the kernel merges the packets of a flow: the recording no longer matches the wire, flow counters are wrong |
+| `lro` | the same, in hardware |
+| `tso`, `gso` | segmentation on transmit: no effect on a pure capture NIC, off for consistency |
+| `rxvlan` | the NIC strips the 802.1Q tag: packets are recorded **without their VLAN**, VLAN filters stop matching. Keep it on only when the VLAN must not reach the applications |
+
+**Kernel** (written to `/etc/sysctl.d/60-capfit.conf`, only the keys you accept):
+
+| Key | Recommended | Why |
+|---|---|---|
+| `net.core.netdev_max_backlog` | >= 250000 | queue for bursts the softirq cannot drain at once |
+| `net.core.rmem_max` | >= 268435456 | largest socket receive buffer an application may ask for |
+| `net.core.rmem_default` | >= 33554432 | default receive buffer for libpcap/AF_PACKET users |
+| `vm.dirty_background_bytes` | 268435456 | start writing captured data early, in small portions |
+| `vm.dirty_bytes` | 1073741824 | cap on unwritten data, so n2disk's writer does not stall on a huge flush |
+| `vm.swappiness` | <= 1 | keep capture buffers in RAM |
+
+**Applications**:
+
+| Application | nice | OOM score adj | Locked memory | Files |
+|---|---|---|---|---|
+| n2disk | -10 | -900 | unlimited | 65535 |
+| nprobe | -5 | -500 | unlimited | 65535 |
+
+- Effect: the capture keeps its CPU and is the last thing the kernel kills.
+- The running process is changed live (`renice`, `oom_score_adj`, `prlimit`).
+- A systemd drop-in `60-capfit.conf` makes it stay from the next start of the unit.
+- **Nothing is restarted.**
+
+**Undo:**
+
+- Every original value is saved once, before the first change.
+- `revert` undoes only what capfit changed: offloads, sysctl values and file, priorities of
+  processes that still run, drop-ins and the boot unit.
+- `persist` sets **only the offloads you turned off** again at boot (`capfit.service`, before `n2disk.service`).
+  The kernel file and the drop-ins persist on their own.
+
+Without the menu everything is applied, except the names in `SKIP`:
+
+```
+NICS="eno1np0 eno2np1" bash capfit.sh check
+NICS="eno1np0 eno2np1" SKIP="rxvlan vm.swappiness" bash capfit.sh all
+NICS="eno1np0 eno2np1" bash capfit.sh revert
+```
+
+`SKIP` takes offload names (`gro lro tso gso rxvlan`), kernel keys and application names (`n2disk nprobe`).
 
 ---
 
