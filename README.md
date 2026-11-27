@@ -1,6 +1,6 @@
 # diag - packet capture host toolkit
 
-Four bash scripts for a Linux host that captures mirrored (SPAN/TAP) traffic with
+Five bash scripts for a Linux host that captures mirrored (SPAN/TAP) traffic with
 PF_RING, n2disk and nProbe: find out **why packets are lost**, **tune the capture NICs**
 **fit the host for capture** and **find duplicated packets or loops** in the mirror.
 
@@ -10,6 +10,7 @@ no dependencies beyond `bash`, `ethtool`, `iproute2`, `tcpdump` (and optionally 
 ```
 sudo su -
 git clone https://github.com/0x2e8b/diag && cd diag
+bash doctor.sh        # 0. all of the below in order, explained, one question per change
 bash diag.sh          # 1. what is wrong (read-only)
 bash nic.sh           # 2. tune the NICs (interactive, reversible)
 bash capfit.sh        # 3. offloads, kernel, priorities (asks before every change, reversible)
@@ -18,13 +19,52 @@ bash dup.sh eno1np0   # 4. duplicates / loops on one NIC
 
 | Script | Changes the system? | Use it for |
 |---|---|---|
+| `doctor.sh` | only what you confirm; `revert` undoes its quick fixes | guided run: measure, diagnose, explain, fix, measure again, summary |
 | `diag.sh` | no, read-only | full diagnosis with findings and proposed fixes |
 | `nic.sh` | yes, only after you confirm; `revert` undoes it | RX ring, queues, IRQ placement, RSS, persistence |
 | `capfit.sh` | yes, one question per change; `revert` undoes it | NIC features that alter packets (GRO/LRO/TSO/GSO, VLAN stripping), kernel buffers and disk write-back, n2disk/nprobe priority |
 | `dup.sh` | no (a short `tcpdump`) | duplicated packets, L2/L3 loops, broadcast storms |
 
-Start with `diag.sh`. It tells you whether `nic.sh` will help at all.
+On site, start with `doctor.sh`: it runs the others in the right order. Alone, start with `diag.sh`. It tells you whether `nic.sh` will help at all.
 `capfit.sh` is worth running on every capture host: VLAN stripping and GRO change what is recorded, not only how fast.
+
+---
+
+## doctor.sh - the guided run
+
+One command for a host that loses packets. It runs the other scripts in order, explains every finding
+in plain words (what it means, what to do, who does it: us or the customer's network team) and asks
+before each stage and each change.
+
+```
+bash doctor.sh
+NICS="eno1np0 eno2np1" bash doctor.sh
+SECS=20 DIAG_S=10 bash doctor.sh     # longer loss sample / diag sample
+bash doctor.sh revert                # undo its quick fixes, offers nic.sh / capfit.sh revert too
+```
+
+| Stage | What happens | Changes? |
+|---|---|---|
+| 1 licence | `n2disk --show-system-id` and `--check-license` saved | no |
+| 2 loss now | per NIC: loss %, Mpps, Gbit/s, average packet, loss since boot, every drop/discard/miss counter that grows | no |
+| 3 diagnosis | `diag.sh` | no |
+| 4 explained | each finding: what it means, the fix, who does it | no |
+| 5 duplicates | `dup.sh` 100000 packets per NIC, kinds explained, top pairs for the network team | no |
+| 6 quick fixes | RPS off, CPU governor `performance`, IPv6 off on capture NICs; then measured | yes, each asked, no link reset |
+| 7 verdict | root causes (PF_RING copies, other sockets, bridge, duplicates, stack) vs tuning | no |
+| 8 tuning | only in the agreed window: `nic.sh check/apply`, measure, keep or revert; `capfit.sh check/all`, measure | yes, link resets |
+| 9 result | loss again, `diag.sh` after, licence compared, summary | no |
+
+Loss is `missed / (received + missed)` over the sample, safe against the 32-bit wrap of
+`rx_missed_errors` on i40e. Never read the cumulative `rx_missed_errors` as lifetime loss there: it wraps
+every 4.29e9. "Loss since boot" uses `rx_unicast + rx_multicast + rx_broadcast` against `rx_packets` instead.
+
+When the per-packet cost is above 2 us, tuning keeps the current number of queues: fewer queues
+would raise the loss while each packet is that expensive.
+
+Output: `/root/doctor/doctor-<date>.log` (everything), `summary-<date>.txt` (findings, loss before/after,
+cost per packet, what was changed, what is open for the customer), `measure-<date>.txt`, `diag-before/after`,
+`dup-<nic>`, `licence-before/after`.
 
 ---
 
