@@ -25,4 +25,14 @@ for i in $NICS; do
   echo "$i driver rx_packets in 5 s: $((b-a)); PF_RING tcpdump: $o" > $B/ratio-$i.txt
 done
 bash $HERE/copies.sh > $B/copies.txt 2>&1
+# one screen with what is not yet on any screenshot (for a photo when the file cannot leave the host)
+echo "===== SUMMARY (photo this) ====="
+head -2 $B/uname.txt | tail -1 | cut -c1-160; grep -E '^(PRETTY_NAME)' $B/os.txt
+grep -vE '^#' $B/pfring-pkg.txt | awk '{printf "  %s %s\n", $2, $3}'
+echo "docker containers:"; grep -vE '^#' $B/docker.txt | head -15 | cut -c1-140 | sed 's/^/  /'
+echo "net namespaces (count of processes per ns):"; grep -vE '^#' $B/netns.txt | head -8 | sed 's/^/  /'
+echo "links (name, master, promisc):"; ip -o link | awk -F': ' '{print $2}' | cut -d@ -f1 | while read l; do
+  printf "  %-18s %-14s %s\n" "$l" "$(basename "$(readlink /sys/class/net/$l/master 2>/dev/null)" 2>/dev/null)" "$( (( $(cat /sys/class/net/$l/flags 2>/dev/null || echo 0) & 0x100 )) && echo promisc)"; done | head -25
+cat $B/ratio-*.txt 2>/dev/null | sed -n 's/^\([^ ]*\) driver rx_packets in 5 s: \([0-9]*\);.*/  \1 driver \2/p'
+grep -h 'packets received by filter' $B/ratio-*.txt 2>/dev/null | sed 's/^/  tcpdump: /'
 tar czf $B.tgz -C $(dirname $B) $(basename $B) && rm -rf $B && echo "bundle: $B.tgz ($(du -h $B.tgz | cut -f1))"
