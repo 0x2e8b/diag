@@ -7,13 +7,14 @@
 #   LOOP      3+ different TTLs falling -> L3 routing loop (goes around until TTL runs out)
 #   L2-SAME   non-IP (ARP...) copies    -> mirror duplication or an L2 loop / broadcast storm
 set -u
-IF=${1:?iface}; N=${2:-100000}; D=/tmp/dup.$$; mkdir -p $D
+# env: SHOW=15 sample lines, KIND=LOOP only that kind in the sample lines
+IF=${1:?iface}; N=${2:-100000}; D=/tmp/dup.$$; mkdir -p $D; SHOW=${SHOW:-15}; KIND=${KIND:-}
 if [ -f "$IF" ]; then cp "$IF" $D/s.pcap
 else echo "capturing $N packets on $IF (max 60 s) ..."; timeout 60 tcpdump -nni "$IF" -c "$N" -w $D/s.pcap 2>/dev/null; fi
 tcpdump -nn -e -v -r $D/s.pcap 2>/dev/null |
   awk '/^[0-9][0-9]:/{if(h!="")print h; h=$0; next}{h=h" "$0} END{if(h!="")print h}' > $D/s.txt
 TOTAL=$(wc -l < $D/s.txt)
-awk -v total="$TOTAL" '
+awk -v total="$TOTAL" -v show="$SHOW" -v want="$KIND" '
 {
   line=$0
   ttl="-"; if (match(line, /(ttl|hlim) [0-9]+/)) { split(substr(line, RSTART, RLENGTH), q, " "); ttl=q[2] }
@@ -50,7 +51,7 @@ END {
     else kind="LOOP"
     kc[kind]++
     hosts[p[k]] += c[k]-1; kinds[p[k]]=kind; vls[p[k]]=v[k]
-    if (shown++ < 15) { vv=v[k]; gsub(/  +/, ",", vv); gsub(/^ | $/, "", vv)
+    if ((want=="" || want==kind) && shown++ < show) { vv=v[k]; gsub(/  +/, ",", vv); gsub(/^ | $/, "", vv)
       printf "%4dx %-8s ttl:%s  vlan:%s  %s\n", c[k], kind, substr(t[k],1,36), vv, p[k] }
   }
   printf "\npackets %d, extra copies %d (%.1f%%)\n", total, dup, total?100*dup/total:0
