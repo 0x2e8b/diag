@@ -12,13 +12,17 @@ UNIT=$UNITDIR/capfit.service; SELF=${SELF:-/usr/local/sbin/capfit.sh}; N2CONF=${
 mkdir -p $ST
 have() { command -v $1 >/dev/null 2>&1; }
 warn() { echo "  ! $*"; }
-yes()  { local a; read -rp "$1 [y/N] " a; [[ $a =~ ^[yYtT] ]]; }
+if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
+# question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
+q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
 SKIP=" ${SKIP:-} "
 # one change: interactive -> ask with the reason; otherwise apply unless the name is in SKIP
-confirm() { local name=$1; shift
+# $1 name, $2 why, $3 what Y does, $4 what N does
+confirm() { local name=$1
   [[ $SKIP == *" $name "* ]] && { echo "  skipped $name (SKIP)"; return 1; }
   [ -t 0 ] || return 0
-  echo "  - $name: $*"; yes "    change it?" || { echo "    kept"; return 1; }; }
+  q "$name: $2" "$3" "$4" || { echo "    kept"; return 1; }; }
 WHY_gro="the NIC merges packets of a flow (GRO): the recording no longer matches the wire"
 WHY_lro="the NIC merges TCP segments in hardware (LRO): same problem, bigger packets"
 WHY_tso="segmentation offload on transmit (TSO): no effect on a pure capture NIC, off for consistency"
@@ -53,7 +57,7 @@ choose() {
     have ip && [ -n "$(ip -o -4 addr show dev $i 2>/dev/null)" ] && continue; p="$p $i"; done
   p=$(echo $p)
   if [ -t 0 ]; then echo "Physical NICs: $(for i in $(ls $SYS); do [ -e $SYS/$i/device ] && echo -n "$i "; done)"
-    read -rp "Capture NICs [$p]: " NICS; NICS=${NICS:-$p}; else NICS=$p; fi
+    echo; read -rp "$QM Capture NICs [$p]: " NICS; NICS=${NICS:-$p}; else NICS=$p; fi
   [ -z "$NICS" ] && { echo "no capture NIC: NICS=\"eth1\" bash capfit.sh"; exit 1; }
   echo "$NICS" > $ST/nics
 }
@@ -100,7 +104,7 @@ offloads() {
   for k in $OFFL; do s=${k%%:*}; f=${k#*:}; on=""
     for i in $NICS; do [ "$(feat $i $f)" = on ] && on="$on $i"; done
     [ -z "$on" ] && continue
-    if [ "${MODE:-}" = boot ] || confirm $s "$(why $s) - now on:$on"; then
+    if [ "${MODE:-}" = boot ] || confirm $s "$(why $s)" "turn $s off on$on now (the link may blink); undo: capfit.sh revert" "keep $s on"; then
       for i in $on; do ethtool -K $i $s off 2>/dev/null && echo "    $i: $s off" || warn "$i: $s refused by the driver"; done
       sed -i "/^$s\$/d" $ST/offl.off 2>/dev/null; echo $s >> $ST/offl.off
     fi
@@ -112,7 +116,7 @@ kernel() {
   for x in $KERN; do IFS=: read k rec rule <<< "$x"
     now=$(sysctl -n $k 2>/dev/null); [ -z "$now" ] && continue
     case $rule in min) [ "$now" -ge "$rec" ] && continue;; max) [ "$now" -le "$rec" ] && continue;; eq) [ "$now" = "$rec" ] && continue;; esac
-    confirm $k "$(why $k) - now $now, set $rec" || continue
+    confirm $k "$(why $k)" "set $k = $rec now and in $SYSCTLF (stays after reboot); undo: capfit.sh revert" "keep $now" || continue
     [ -f $SYSCTLF ] || echo "# capfit: capture host kernel settings (bash capfit.sh revert removes this file)" > $SYSCTLF
     sed -i "/^$k = /d" $SYSCTLF; echo "$k = $rec" >> $SYSCTLF
     sysctl -w "$k=$rec" >/dev/null && echo "    $k = $rec (in $SYSCTLF)"
@@ -124,7 +128,10 @@ priority() {
   for a in $APPS; do IFS=: read n rec o <<< "$a"
     p=$(pids $n); u=$(units $n)
     [ -z "$p$u" ] && continue
-    confirm $n "nice $rec, OOM protection $o, unlimited locked memory: the capture keeps its CPU and is the last process the kernel kills; running process now (pid $(echo $p)) + drop-in for ${u:-no unit} used from its next start" || continue
+    u=$(echo $u)
+    confirm $n "nice $rec, OOM protection $o, unlimited locked memory: the capture keeps its CPU and is the last process the kernel kills" \
+      "$([ -n "$p" ] && echo "running $n (pid $(echo $p)) changed now, " || echo "$n is not running: ")${u:+drop-in for $u used from its next start; }nothing restarts; undo: capfit.sh revert" \
+      "priority of $n unchanged" || continue
     for p in $p; do
       [ -f $ST/prio.$p ] || echo "$(nicev $p) $(oomv $p)" > $ST/prio.$p
       renice -n $rec -p $p >/dev/null 2>&1; echo $o > $PROC/$p/oom_score_adj 2>/dev/null
@@ -190,15 +197,15 @@ while :; do
   echo " 6 persist   the offloads you turned off, again after reboot"
   echo " 7 revert    everything back to the original"
   echo " 8 change NICs      0 quit"
-  read -rp "> " c
+  echo; read -rp "$QM choose 0-8 > " c
   case $c in
     1) run check ;;
     2) run offloads ;;
     3) run kernel ;;
     4) run priority ;;
     5) run all ;;
-    6) yes "Set offloads at every boot?" && run persist ;;
-    7) yes "Undo everything capfit changed?" && run revert ;;
+    6) q "Turn the same offloads off at every boot?" "installs capfit.service, runs before n2disk at boot; undo: 7 revert" "offloads come back after reboot (kernel and priorities stay anyway)" && run persist ;;
+    7) q "Undo everything capfit changed?" "offloads on again, kernel file removed and old values back, priorities and drop-ins removed" "nothing changes" && run revert ;;
     8) rm -f $ST/nics; NICS=""; choose ;;
     0|q) exit 0 ;;
   esac

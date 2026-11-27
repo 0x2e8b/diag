@@ -13,8 +13,11 @@ mkdir -p $ST
 have() { command -v $1 >/dev/null 2>&1; }
 say()  { echo "$*"; }
 warn() { echo "  ! $*"; }
-ask()  { local a; read -rp "$1 " a; echo "${a:-$2}"; }
-yes()  { local a; read -rp "$1 [y/N] " a; [[ $a =~ ^[yYtT] ]]; }
+ask()  { local a; echo >&2; read -rp "$QM $1 " a; echo "${a:-$2}"; }
+if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
+# question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
+q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
 
 # ---------- reading the NIC (every reader returns "" when the driver lacks it) ----------
 expand() { tr , '\n' | while IFS=- read a b; do [ -n "$a" ] && seq $a ${b:-$a}; done; }
@@ -60,7 +63,7 @@ propose() {   # n2disk ifaces, else promisc without IP, else up without IP
 }
 choose() {
   [ -n "${NICS:-}" ] && return
-  [ -s $ST/nics ] && { NICS=$(cat $ST/nics); say "NICs from the last run ($ST/nics): $NICS"; [ -t 0 ] || return; yes "Keep them?" && return; }
+  [ -s $ST/nics ] && { NICS=$(cat $ST/nics); say "NICs from the last run ($ST/nics): $NICS"; [ -t 0 ] || return; q "Use the same NICs as last time ($NICS)?" "use them" "choose the NICs again" y && return; }
   say "Physical NICs:"; list_nics | awk -F'|' '{printf "  %-12s %-10s %6s Mb/s %s\n", $1, $2, $3, $4}'
   local p; p=$(propose | tr '\n' ' ' | sed 's/ *$//')
   NICS=$(ask "Capture NICs, space separated [$p]:" "$p")
@@ -103,7 +106,7 @@ plan() {
       if [ -z "$dec" ]; then
         if [ -t 0 ] && [ "${MODE:-}" != boot ]; then
           say "$i has $cur queues now; the plan is $q (one per free physical core, ${RES[$n]} cores kept for n2disk/nprobe)."
-          if yes "  Reduce $i from $cur to $q queues?"; then dec=$q; else dec=$cur; fi
+          if q "Reduce $i from $cur to $q queues?" "$i gets $q queues (one per free physical core) at the next apply, $RS" "keep $cur queues (recommended while each packet is expensive: fewer queues = fewer cores take packets)"; then dec=$q; else dec=$cur; fi
           echo $dec > $ST/$i.q
         else dec=$cur; warn "$i: keeping $cur queues (more than the plan $q); run Q=$q to reduce"; fi
       fi
@@ -230,13 +233,13 @@ while :; do
   say " 6 revert   back to the original                                  (link resets!)"
   say " 7 status   state only"
   say " 8 change NICs      0 quit"
-  case $(ask ">" "") in
+  case $(ask "choose 0-8 >" "") in
     1) run check ;;
-    2) yes "Links of $NICS go down for a few seconds. Apply?" && run apply ;;
+    2) q "Apply the tuning to $NICS?" "$RS ~3 s (n2disk loses them): ring to max, GRO/LRO off, IRQs on own cores, irqbalance off; undo: 6 revert" "nothing changes" && run apply ;;
     3) run measure ;;
-    4) yes "Links reset. Hash UDP on ports?" && run rss ;;
-    5) yes "Run at every boot?" && run persist ;;
-    6) yes "Back to the original settings?" && run revert ;;
+    4) q "Hash UDP on ports too?" "$RS: UDP spread over queues by ports (helps when one queue takes most); undo: 6 revert" "nothing changes" && run rss ;;
+    5) q "Keep the tuning after reboot?" "installs nic-tune.service, runs before n2disk at every boot; undo: 6 revert" "the tuning lasts until reboot" && run persist ;;
+    6) q "Back to the original settings?" "$RS: ring, queues, GRO/LRO, UDP hash and irqbalance as before the first run; boot unit removed" "nothing changes" && run revert ;;
     7) run status ;;
     8) rm -f $ST/nics; NICS=""; choose; SLOT=(); QN=(); AL=(); CNT=(); FREE=(); RSV=(); RES=(); NP=(); SIBOF=(); plan ;;
     0|q) exit 0 ;;

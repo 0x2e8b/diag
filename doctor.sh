@@ -18,8 +18,10 @@ stage() { echo; echo "${B}==================== $* ====================${N}"; }
 ok()    { echo "${G}OK${N}      $*"; }
 bad()   { echo "${R}BROKEN${N}  $*"; }
 note()  { echo "${Y}NOTE${N}    $*"; }
-yn()    { local a; read -rp "$1 [Y/n] " a; [[ ! $a =~ ^[nN] ]]; }
-ny()    { local a; read -rp "$1 [y/N] " a; [[ $a =~ ^[yYtT] ]]; }
+if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
+# question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
+q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
 sum()   { echo "$*" >> $SUM; }
 CHG=(); OPEN=()
 
@@ -37,7 +39,7 @@ choose() {
   [ -z "$p" ] && for i in $(ls $SYS); do [ -e $SYS/$i/device ] || continue; (( $(cat $SYS/$i/flags) & 0x100 )) || continue
     have ip && [ -n "$(ip -o -4 addr show dev $i 2>/dev/null)" ] && continue; p="$p $i"; done
   p=$(echo $p)
-  read -rp "Capture NICs [$p]: " NICS; NICS=$(echo ${NICS:-$p})
+  echo; read -rp "$QM Capture NICs [$p]: " NICS; NICS=$(echo ${NICS:-$p})
   [ -z "$NICS" ] && { echo "no capture NIC: NICS=\"eth1 eth2\" bash doctor.sh"; exit 1; }
   for i in $NICS; do [ -e $SYS/$i ] || { echo "$i does not exist"; exit 1; }; done
 }
@@ -66,17 +68,20 @@ measure() {   # $1 label; loss = missed / (received + missed) over SECS, safe ag
     set -- $(echo "$r" | grep '^M '); l=$4
     echo "$2 $3 $4 $5 $6 $7" >> $MF
     if awk -v x=$l 'BEGIN{exit !(x>1)}'; then bad "$i loses ${B}$l%${N} of arriving packets at the NIC"; else ok "$i loss $l%"; fi
-    echo "        arriving $(awk -v p=$5 'BEGIN{printf "%.2f", p/1e6}') Mpps, received $6 Gbit/s, average packet $7 B"
+    echo "        arriving $(awk -v p=$5 'BEGIN{if(p>=100000) printf "%.2f Mpps", p/1e6; else printf "%d pps", p}'), received $6 Gbit/s, average packet $7 B"
     [ "$8" = no ] && note "$i: driver has no rx_missed_errors counter, the loss above is a lower bound"
     echo "$r" | grep '^LIFE' | while read _ x; do echo "        since boot about ${x}% never reached the host (rx_unicast+multicast+broadcast vs rx_packets)"; done
     echo "$r" | grep '^GREW' | sed 's/^GREW /        counter growing: /'
   done; rm -f $DST/.s0.* $DST/.s1.*; }
 loss_of() { awk -v l=$1 -v n=$2 '$1==l && $2==n{x=$3} END{print x}' $MF 2>/dev/null; }
-compare() {   # $1 before label, $2 after label -> prints, returns 0 if any NIC improved by >= 1 point
-  local i a b better=1
+compare() {   # $1 before, $2 after label -> 0 any NIC improved by >= 1 point, 2 no loss before or after, 1 no gain
+  local i a b better=1 lossy=0
   for i in $NICS; do a=$(loss_of $1 $i); b=$(loss_of $2 $i); [ -z "$a" ] || [ -z "$b" ] && continue
     echo "   $i: loss $a% -> $b%"
-    awk -v a=$a -v b=$b 'BEGIN{exit !(a-b>=1)}' && better=0; done; return $better; }
+    awk -v a=$a -v b=$b 'BEGIN{exit !(a-b>=1)}' && better=0
+    awk -v a=$a -v b=$b 'BEGIN{exit !(a>=1 || b>=1)}' && lossy=1; done
+  [ $better = 0 ] && return 0; [ $lossy = 0 ] && return 2; return 1; }
+maxloss() { awk -v l=$1 '$1==l && $3>m{m=$3} END{print m+0}' $MF 2>/dev/null; }
 
 # ---------- licence ----------
 lic() { have n2disk || { echo "n2disk not installed"; return; }
@@ -127,6 +132,9 @@ explain() {
         echo "   running consumers:"; ps -eo pid,args 2>/dev/null | grep -E '[n]2disk|[n]probe|[p]fcount|[z]balance' | cut -c1-160 | sed 's/^/     /';;
       *"PF_RING:"*"lost up to"*)
         issue $sev "$t" "the application itself reads too slowly and its ring overflows. A different problem from NIC loss: the NIC delivered, the app missed it" "$fx" "us";;
+      *"IDS reads the capture traffic"*)
+        issue $sev "$t" "an IDS (Suricata/Zeek/Snort) reads the NIC on purpose. Its threads share one fanout group, so it costs one copy, not one per socket" \
+          "nothing while the IDS is wanted" "nobody";;
       *"AF_PACKET sockets"*) ROOT="$ROOT sockets"
         issue $sev "$t" "another program (tcpdump, a libpcap tool, an old recorder, an 'any' capture) gets its own copy of every packet" "stop it if it is not needed" "us"
         have ss && ss -0 -p 2>/dev/null | awk 'NR>1' | cut -c1-160 | sed 's/^/     /' | head -8;;
@@ -168,19 +176,22 @@ quick() {
   local i f v any=0 cur
   for i in $NICS; do for f in $SYS/$i/queues/rx-*/rps_cpus; do [ -r $f ] || continue
       v=$(tr -d ',0\n' < $f); [ -n "$v" ] && { any=1; break; }; done; done
-  if [ $any = 1 ] && yn "RPS is on: packets are handed to another core a second time. Turn RPS off on $NICS?"; then
+  if [ $any = 1 ] && q "RPS is on: every packet is handed to another core a second time. Turn RPS off on $NICS?" \
+       "rps_cpus = 0 on every queue now, no link reset; lasts until reboot; undo: bash doctor.sh revert" "RPS stays on" y; then
     for i in $NICS; do for f in $SYS/$i/queues/rx-*/rps_cpus; do [ -r $f ] || continue
         grep -q "^$f " $DST/rps.orig 2>/dev/null || echo "$f $(cat $f)" >> $DST/rps.orig; echo 0 > $f; done; done
     ok "RPS off"; CHG+=("RPS off on $NICS (doctor revert)"); fi
   cur=$(cat $CPUDIR/cpu0/cpufreq/scaling_governor 2>/dev/null)
   if [ -n "$cur" ] && [ "$cur" != performance ] && grep -qw performance $CPUDIR/cpu0/cpufreq/scaling_available_governors 2>/dev/null &&
-     yn "CPU governor is '$cur': cores slow down and every packet costs more. Set 'performance' (until reboot)?"; then
+     q "CPU governor is '$cur': cores slow down and every packet costs more. Set 'performance'?" \
+       "all cores at full clock now (more power, more heat), until reboot; undo: bash doctor.sh revert" "governor stays '$cur'" y; then
     [ -f $DST/gov.orig ] || echo $cur > $DST/gov.orig
     for f in $CPUDIR/cpu[0-9]*/cpufreq/scaling_governor; do echo performance > $f 2>/dev/null; done
     ok "governor performance"; CHG+=("CPU governor performance, until reboot (doctor revert)"); fi
   for i in $NICS; do f=/proc/sys/net/ipv6/conf/$i/disable_ipv6; [ -w $f ] || continue
     [ "$(cat $f)" = 0 ] && have ip && [ -n "$(ip -6 addr show dev $i 2>/dev/null)" ] || continue
-    if yn "$i has IPv6 on: the capture NIC answers and sends its own packets (ND/MLD). Disable IPv6 on $i?"; then
+    if q "$i has IPv6 on: the capture NIC answers and sends its own packets (ND/MLD). Disable IPv6 on $i?" \
+       "disable_ipv6 = 1 on $i only, capture unaffected, until reboot; undo: bash doctor.sh revert" "IPv6 stays on $i" y; then
       grep -q "^$i " $DST/ipv6.orig 2>/dev/null || echo "$i 0" >> $DST/ipv6.orig; echo 1 > $f
       ok "$i IPv6 off"; CHG+=("IPv6 off on $i, until reboot (doctor revert)"); fi; done
 }
@@ -189,8 +200,8 @@ revert_quick() {
   [ -f $DST/rps.orig ] && { while read f v; do echo $v > $f 2>/dev/null; done < $DST/rps.orig; rm -f $DST/rps.orig; echo "RPS restored"; }
   [ -f $DST/gov.orig ] && { v=$(cat $DST/gov.orig); for f in $CPUDIR/cpu[0-9]*/cpufreq/scaling_governor; do echo $v > $f 2>/dev/null; done; rm -f $DST/gov.orig; echo "governor back to $v"; }
   [ -f $DST/ipv6.orig ] && { while read i v; do echo $v > /proc/sys/net/ipv6/conf/$i/disable_ipv6 2>/dev/null; done < $DST/ipv6.orig; rm -f $DST/ipv6.orig; echo "IPv6 restored"; }
-  ny "Also undo nic.sh (ring, queues, IRQs; link resets)?" && NICS="$NICS" bash $HERE/nic.sh revert
-  ny "Also undo capfit.sh (offloads, kernel, priorities)?" && NICS="$NICS" bash $HERE/capfit.sh revert
+  q "Also undo nic.sh?" "$RS: ring, queues, GRO/LRO, IRQs, irqbalance back to the original" "nic.sh settings stay" && NICS="$NICS" bash $HERE/nic.sh revert
+  q "Also undo capfit.sh?" "offloads, kernel settings, priorities and drop-ins back to the original" "capfit.sh settings stay" && NICS="$NICS" bash $HERE/capfit.sh revert
 }
 
 # ================================= main =================================
@@ -199,6 +210,7 @@ for s in diag.sh dup.sh nic.sh capfit.sh; do [ -r $HERE/$s ] || { echo "missing 
 choose
 [ "${1:-}" = revert ] && { revert_quick; exit; }
 exec > >(tee -a $LOG) 2>&1
+touch $DST/.start-$TS; CST=${CAPFIT_ST:-/root/capfit}
 trap 'echo; echo "stopped. log: $LOG  summary so far: $SUM"; exit 1' INT
 sum "doctor $(date '+%F %T')  host $(hostname)  NICs: $NICS"
 echo "doctor  host $(hostname)  NICs: $NICS  log $LOG"
@@ -221,45 +233,64 @@ explain $DST/diag-before-$TS.txt
 [ -z "$(findings $DST/diag-before-$TS.txt)" ] && ok "diag.sh found nothing obvious"
 
 stage "5/9 duplicates and loops in the mirror (dup.sh, up to 60 s per NIC)"
-if have tcpdump && yn "Check duplicates on $NICS (100000 packets each)?"; then for i in $NICS; do dupcheck $i; done; fi
+if have tcpdump && q "Check duplicates on $NICS?" "tcpdump reads 100000 packets per NIC (max 60 s each), changes nothing" "skip, go to quick fixes" y; then for i in $NICS; do dupcheck $i; done; fi
 
 stage "6/9 quick fixes (no link reset, undo: bash doctor.sh revert)"
-quick; [ ${#CHG[@]} -gt 0 ] && measure after-quick && compare before after-quick
+quick; if [ ${#CHG[@]} -gt 0 ]; then measure after-quick; compare before after-quick; else ok "nothing to fix here"; fi
 
 stage "7/9 verdict before tuning"
 if [ -n "$ROOT" ]; then
   bad "root causes found:$(echo $ROOT | tr ' ' '\n' | sort -u | tr '\n' ' ')"
   echo "   These multiply the cost of every packet. Fix them first: NIC tuning alone gives only a few points."
+elif awk -v x=$(maxloss before) 'BEGIN{exit !(x<1)}'; then ok "no loss at the NIC and no root cause: nothing to repair, capfit below only checks that recordings are correct"
 else ok "no root cause found in copies, sockets, bridge, duplicates or stack; tuning is the next step"; fi
-[ -n "$COST0" ] && echo "   cost per packet now: $COST0 us (normal 0.3-1 us per consumer)"
+echo "   cost per packet now: ${COST0:-n/a (traffic below 100k pps)}${COST0:+ us} (normal 0.3-1 us per consumer)"
 
-stage "8/9 NIC tuning and host fitting (link resets for a few seconds!)"
-if yn "Are we in the agreed window (n2disk loses a few seconds of traffic on each link reset)?"; then
+stage "8/9 NIC tuning and host fitting"
+L0=$(maxloss before); TUNE=1
+if awk -v x=$L0 'BEGIN{exit !(x<1)}'; then
+  ok "no loss at the NIC (max $L0%): nothing for nic.sh to improve"
+  q "Run nic.sh anyway?" "$RS: check, then apply if you confirm; n2disk loses a few seconds" "skip nic.sh (recommended)" || TUNE=0
+else
+  q "Are we in the agreed window? nic.sh resets the links" "go on: nic.sh check (read-only), then a separate question before apply" "skip nic.sh, run it later in the window" y || TUNE=0
+fi
+if [ $TUNE = 1 ]; then
   Q=""; if [ -n "$COST0" ] && awk -v c=$COST0 'BEGIN{exit !(c>2)}'; then
     Q=$(for i in $NICS; do ethtool -l $i 2>/dev/null | awk '/Current/{c=1} c&&/^Combined:/{print $2; exit}'; done | sort -n | tail -1)
     [ -n "$Q" ] && note "cost per packet is $COST0 us: keeping the current $Q queues (fewer queues would make the loss worse now)"; fi
   env NICS="$NICS" ${Q:+Q=$Q} bash $HERE/nic.sh check
-  if yn "Apply nic.sh (ring max, GRO/LRO off, IRQs on the NIC's own cores, irqbalance off)?"; then
+  if q "Apply nic.sh to $NICS?" "$RS ~3 s (n2disk loses them): ring to max, GRO/LRO off, IRQs on the NIC's own cores, irqbalance off; then measured" "nothing changes, go to capfit" y; then
     env NICS="$NICS" ${Q:+Q=$Q} bash $HERE/nic.sh apply
-    measure after-nic
-    if compare before after-nic; then ok "nic.sh helped"
-      yn "Keep it after reboot (nic.sh persist)?" && { env NICS="$NICS" ${Q:+Q=$Q} bash $HERE/nic.sh persist; CHG+=("nic.sh apply + persist (undo: bash nic.sh revert)"); } || CHG+=("nic.sh apply, until reboot (undo: bash nic.sh revert)")
-    else bad "nic.sh did not help"
-      if yn "Undo it (nic.sh revert, link resets)?"; then NICS="$NICS" bash $HERE/nic.sh revert; else CHG+=("nic.sh apply without gain (undo: bash nic.sh revert)"); fi; fi
+    measure after-nic; compare before after-nic; rc=$?
+    if [ $rc = 0 ]; then ok "nic.sh lowered the loss"
+      if q "Keep the nic.sh tuning after reboot?" "installs nic-tune.service (runs before n2disk at boot); undo: bash nic.sh revert" "tuning lasts until reboot" y; then
+        env NICS="$NICS" ${Q:+Q=$Q} bash $HERE/nic.sh persist; CHG+=("nic.sh apply + persist (undo: bash nic.sh revert)")
+      else CHG+=("nic.sh apply, until reboot (undo: bash nic.sh revert)"); fi
+    elif [ $rc = 2 ]; then ok "no loss before or after: nothing to improve, settings kept (they match the recommendation)"
+      CHG+=("nic.sh apply, until reboot, no loss to improve (undo: bash nic.sh revert)")
+    else bad "nic.sh did not lower the loss"
+      if q "Undo nic.sh?" "$RS: ring, queues, GRO/LRO, IRQs, irqbalance back to the original" "keep it (it does no harm), undo later: bash nic.sh revert" y; then
+        NICS="$NICS" bash $HERE/nic.sh revert
+      else CHG+=("nic.sh apply without gain (undo: bash nic.sh revert)"); fi; fi
   fi
-  NICS="$NICS" bash $HERE/capfit.sh check
-  if yn "Run capfit.sh (asks before EVERY change; VLAN stripping is the customer's decision)?"; then
-    NICS="$NICS" bash $HERE/capfit.sh all
-    measure after-capfit
-    compare before after-capfit && ok "loss lower than at the start" || note "no clear change in loss (capfit is mostly about correct recordings, not speed)"
-    yn "Set the offloads you turned off again at every boot (capfit.sh persist)?" && NICS="$NICS" bash $HERE/capfit.sh persist
-    CHG+=("capfit.sh changes (undo: bash capfit.sh revert)")
-  fi
-else note "tuning skipped: run doctor again in the window, or nic.sh / capfit.sh by hand"; fi
+fi
+NICS="$NICS" bash $HERE/capfit.sh check
+if q "Run capfit.sh?" "a separate question before EVERY change (offloads, kernel, priorities); VLAN stripping is the customer's decision" "skip, nothing changes" y; then
+  NICS="$NICS" bash $HERE/capfit.sh all | tee $DST/capfit-$TS.txt
+  CF=$(grep -E '^    [^ ]' $DST/capfit-$TS.txt | grep -vE '^    (kept|Y |N |\[)' | sed 's/^ *//')
+  if [ -n "$CF" ]; then
+    while IFS= read -r c; do CHG+=("capfit: $c"); done <<< "$CF"; CHG+=("(undo capfit: bash capfit.sh revert)")
+    measure after-capfit; compare before after-capfit; rc=$?
+    [ $rc = 0 ] && ok "loss lower than at the start" || note "no change in loss (capfit is mostly about correct recordings, not speed)"
+    if [ -f $CST/offl.off ] && [ $CST/offl.off -nt $DST/.start-$TS ]; then
+      q "Turn the same offloads off at every boot?" "installs capfit.service (before n2disk); undo: bash capfit.sh revert" "offloads come back after reboot" y &&
+        NICS="$NICS" bash $HERE/capfit.sh persist; fi
+  else ok "capfit changed nothing"; fi
+fi
 
 stage "9/9 result"
 measure final
-DF=""; if yn "Run diag.sh again for the 'after' report (~$((DIAG_S + 15)) s)?"; then
+DF=""; if q "Run diag.sh again for the 'after' report?" "read-only, ~$((DIAG_S + 15)) s, saved next to the 'before' report" "skip, the summary uses the loss measurements only" y; then
   NICS="$NICS" S=$DIAG_S DUP=0 bash $HERE/diag.sh > $DST/diag-after-$TS.txt 2>&1; DF=$DST/diag-after-$TS.txt
   echo "after report: $DF"; fi
 lic > $DST/licence-after-$TS.txt
@@ -267,10 +298,11 @@ if diff -q $DST/licence-before-$TS.txt $DST/licence-after-$TS.txt >/dev/null; th
 else bad "${R}n2disk SystemID/licence output CHANGED - stop and check before anything else${N}"; diff $DST/licence-before-$TS.txt $DST/licence-after-$TS.txt; fi
 
 { echo; echo "== loss per NIC (label nic loss% arriving_pps Gbit/s avg_B)"; cat $MF
-  echo; echo "== cost per packet: before ${COST0:-?} us, after $( [ -n "$DF" ] && cost_of $DF || echo '?') us (normal 0.3-1 us per consumer)"
+  C1=$([ -n "$DF" ] && cost_of $DF); na="n/a (traffic below 100k pps)"
+  echo; echo "== cost per packet: before ${COST0:-$na}${COST0:+ us}, after ${C1:-$([ -n "$DF" ] && echo "$na" || echo "not measured")}${C1:+ us} (normal 0.3-1 us per consumer)"
   echo; echo "== changed today"; [ ${#CHG[@]} -eq 0 ] && echo "nothing"; for c in "${CHG[@]}"; do echo "- $c"; done
   echo; echo "== open for the customer"; [ ${#OPEN[@]} -eq 0 ] && echo "nothing"; for c in "${OPEN[@]}"; do echo "- $c"; done
-  echo; echo "== if loss stays after the root causes are gone: PF_RING ZC driver + zbalance_ipc (licence), dedicated capture disk"
+  awk -v x=$(maxloss final) 'BEGIN{exit !(x>=1)}' && { echo; echo "== loss stays ($(maxloss final)%): once the root causes are gone, next is the PF_RING ZC driver + zbalance_ipc (licence) and a dedicated capture disk"; }
 } >> $SUM
 stage "summary ($SUM)"; cat $SUM
 echo; echo "log $LOG   reports in $DST   undo quick fixes: bash doctor.sh revert"

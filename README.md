@@ -59,6 +59,18 @@ Loss is `missed / (received + missed)` over the sample, safe against the 32-bit 
 `rx_missed_errors` on i40e. Never read the cumulative `rx_missed_errors` as lifetime loss there: it wraps
 every 4.29e9. "Loss since boot" uses `rx_unicast + rx_multicast + rx_broadcast` against `rx_packets` instead.
 
+Every question in `doctor.sh`, `nic.sh` and `capfit.sh` looks the same: a yellow ` Q ` marker, then what **Y** does
+and what **N** does, the default in capitals. Questions that reset the link say `LINK RESET` in red.
+
+```
+ Q  Apply nic.sh to eno1np0 eno2np1?
+    Y  LINK RESET ~3 s (n2disk loses them): ring to max, GRO/LRO off, IRQs on the NIC's own cores, irqbalance off; then measured
+    N  nothing changes, go to capfit
+    [Y/n] >
+```
+
+With no loss at the NIC (below 1%), `doctor.sh` recommends skipping `nic.sh` and says so instead of reporting a failure.
+
 When the per-packet cost is above 2 us, tuning keeps the current number of queues: fewer queues
 would raise the loss while each packet is that expensive.
 
@@ -96,7 +108,7 @@ What it checks:
 | NIC | which CPUs handled its interrupts, their NUMA node | interrupts on the other NUMA node |
 | NIC | RPS, bridge/bond membership, IP address | RPS on; NIC inside a bridge; IP on a capture NIC |
 | PF_RING | every ring: application, device, cluster, pps, loss | a packet copied to more than 2 rings; a NIC no ring reads; ring loss > 1% |
-| Other receivers | AF_PACKET sockets (tcpdump, libpcap tools, `any` captures) | any socket sees the capture traffic |
+| Other receivers | AF_PACKET sockets (tcpdump, libpcap tools, `any` captures) | any socket sees the capture traffic; an IDS (Suricata, Zeek, Snort) is only `INFO`: its threads share one fanout group, so it is one copy |
 | Applications | n2disk, nprobe, suricata, zeek, tcpdump, zbalance_ipc, cento | (listed) |
 | Storage | n2disk `-o` directory: filesystem, disk busy % | on the root filesystem; disk > 80% busy |
 | Duplicates | `dup.sh` on 20000 packets per NIC | > 5% extra copies |

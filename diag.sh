@@ -146,8 +146,16 @@ declare -A IDX; for i in $NICS; do IDX[$(cat $SYS/$i/ifindex 2>/dev/null)]=$i; d
 pk=$(awk 'NR>1{print $5}' $PROC/net/packet 2>/dev/null | sort | uniq -c | while read c ix; do
   [ "$ix" = 0 ] && echo "$c on ALL interfaces" || { [ -n "${IDX[$ix]:-}" ] && echo "$c on ${IDX[$ix]}"; }; done)
 echo "${pk:-none on the capture NICs}"
-have ss && ss -0 -p 2>/dev/null | grep -E "$(echo $NICS | tr ' ' '|')|\*:\*|\*  " | awk '{print "  " $0}' | head -10
-[ -n "$pk" ] && fnd 2 "AF_PACKET sockets see capture traffic ($(echo $pk | tr '\n' ',')): each gets its own kernel copy" "stop what is not needed (tcpdump, old recorder, a pcap-based tool, 'any' captures); see the ss lines in the report"
+SSL=$(have ss && ss -0 -p 2>/dev/null | grep -E "$(echo $NICS | tr ' ' '|')|\*:\*|\*  ")
+[ -n "$SSL" ] && echo "$SSL" | awk '{print "  " $0}' | head -10
+# owners of the sockets; an IDS (Suricata, Zeek, Snort) reading the NIC is intended: its threads share one fanout group = 1 copy
+OWN=$(echo "$SSL" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort | uniq -c | awk '{printf "%s x%d, ", $2, $1}' | sed 's/, $//')
+UNK=$(echo "$SSL" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | grep -viE '^(suricata|zeek|snort|bro)' | sort -u)
+if [ -n "$pk" ] && [ -n "$OWN" ] && [ -z "$UNK" ]; then
+  fnd 3 "IDS reads the capture traffic via AF_PACKET ($OWN): an intended consumer, its sockets share one fanout group = 1 extra copy" "nothing to do while the IDS is wanted; it is one more kernel copy per packet, included in the per-packet cost"
+elif [ -n "$pk" ]; then
+  fnd 2 "AF_PACKET sockets see capture traffic ($(echo $pk | tr '\n' ',' | sed 's/,$//')${OWN:+; owners: $OWN}): each program gets its own kernel copy" "stop what is not needed (tcpdump, old recorder, a pcap-based tool, 'any' captures); see the ss lines in the report"
+fi
 
 # ---------- applications ----------
 h "Capture applications"
