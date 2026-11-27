@@ -7,12 +7,13 @@
 #   bash pfupdate.sh build94    alternative: build PF_RING 9.4.0-11029 kernel module from debs/ (fix included)
 #   bash pfupdate.sh reload     IN THE WINDOW: stop n2disk/nprobe, reload pf_ring, start them, check licence + ratio
 #   bash pfupdate.sh revert     original DKMS source back (and 9.4 removed), then: bash pfupdate.sh reload
+# env: PFV=<dkms version> to pick one when several pfring DKMS versions exist (default: highest)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ST=/root/pfupdate; mkdir -p $ST; K=$(uname -r)
 LOG=$ST/pfupdate-$(date +%Y%m%d-%H%M%S).log; exec > >(tee -a $LOG) 2>&1
 have() { command -v $1 >/dev/null 2>&1; }
 die()  { echo "STOP: $*"; exit 1; }
-dkver() { dkms status pfring 2>/dev/null | sed -n 's#^pfring/\([^,:]*\)[,:].*#\1#p' | sort -V | tail -1; }
+dkver() { [ -n "${PFV:-}" ] && { echo $PFV; return; }; dkms status pfring 2>/dev/null | sed -n 's#^pfring/\([^,:]*\)[,:].*#\1#p' | sort -V | tail -1; }
 src()   { echo /usr/src/pfring-$1/pf_ring.c; }
 units() { systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -E '^(n2disk|nprobe|cento|zbalance)' ; }
 lic()   { have n2disk && { timeout 30 n2disk --show-system-id; timeout 30 n2disk --check-license; } 2>&1 | sed -E 's#[0-9]{2}/[A-Za-z]{3}/[0-9]{4} [0-9:]{8} ##; s#\[[^]]*\] ##g' | grep -v '^ *$'; }
