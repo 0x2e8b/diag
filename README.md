@@ -60,7 +60,7 @@ Loss is `missed / (received + missed)` over the sample, safe against the 32-bit 
 every 4.29e9. "Loss since boot" uses `rx_unicast + rx_multicast + rx_broadcast` against `rx_packets` instead.
 
 Every question in `doctor.sh`, `nic.sh` and `capfit.sh` looks the same: a yellow ` Q ` marker, then what **Y** does
-and what **N** does, the default in capitals. Questions that reset the link say `LINK RESET` in red.
+and what **N** does, the default in capitals. The answer is written back (`-> yes`, `-> no (default)`), so the log shows every decision. Questions that reset the link say `LINK RESET` in red.
 
 ```
  Q  Apply nic.sh to eno1np0 eno2np1?
@@ -265,16 +265,20 @@ bash capfit.sh
 | `vm.dirty_bytes` | 1073741824 | cap on unwritten data, so n2disk's writer does not stall on a huge flush |
 | `vm.swappiness` | <= 1 | keep capture buffers in RAM |
 
-**Applications**:
+**Applications**, two separate questions per application:
 
-| Application | nice | OOM score adj | Locked memory | Files |
+| Item | n2disk | nprobe | Effect | When |
 |---|---|---|---|---|
-| n2disk | -10 | -900 | unlimited | 65535 |
-| nprobe | -5 | -500 | unlimited | 65535 |
+| `<app>-protect`: OOM score adj, locked memory, open files | -900, unlimited, 65535 | -500, unlimited, 65535 | killed last when RAM runs out; buffers stay in RAM; no "too many open files" | always safe |
+| `<app>-nice`: nice | -10 | -5 | wins CPU against other programs on the same core | only when the app runs on its own cores |
 
-- Effect: the capture keeps its CPU and is the last thing the kernel kills.
+- **Why nice can hurt:** under heavy load the kernel receives packets in `ksoftirqd` threads, which run at nice 0.
+  An unpinned n2disk at nice -10 takes their CPU and the NIC loss can rise. `check` shows whether the app is
+  pinned (some thread limited to fewer CPUs, e.g. n2disk `-c/-w/-z`); the question says "RECOMMENDED: N" when it is not,
+  and the non-interactive mode skips nice for an unpinned app.
+- Already set values are not asked again.
 - The running process is changed live (`renice`, `oom_score_adj`, `prlimit`).
-- A systemd drop-in `60-capfit.conf` makes it stay from the next start of the unit.
+- Drop-ins `60-capfit.conf` (protection) and `60-capfit-nice.conf` make it stay from the next start of the unit.
 - **Nothing is restarted.**
 
 **Undo:**
@@ -293,7 +297,7 @@ NICS="eno1np0 eno2np1" SKIP="rxvlan vm.swappiness" bash capfit.sh all
 NICS="eno1np0 eno2np1" bash capfit.sh revert
 ```
 
-`SKIP` takes offload names (`gro lro tso gso rxvlan`), kernel keys and application names (`n2disk nprobe`).
+`SKIP` takes offload names (`gro lro tso gso rxvlan`), kernel keys and application items (`n2disk-protect n2disk-nice nprobe-protect nprobe-nice`, or `n2disk` / `nprobe` for both).
 
 ---
 

@@ -17,7 +17,9 @@ ask()  { local a; echo >&2; read -rp "$QM $1 " a; echo "${a:-$2}"; }
 if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
 # question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
 q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
-      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a
+      if [[ ${a:-$d} =~ ^[yYtT] ]]; then echo "    -> yes$([ -z "$a" ] && echo ' (default)')"; return 0; fi
+      echo "    -> no$([ -z "$a" ] && echo ' (default)')"; return 1; }
 
 # ---------- reading the NIC (every reader returns "" when the driver lacks it) ----------
 expand() { tr , '\n' | while IFS=- read a b; do [ -n "$a" ] && seq $a ${b:-$a}; done; }

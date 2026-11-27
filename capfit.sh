@@ -15,12 +15,14 @@ warn() { echo "  ! $*"; }
 if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
 # question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
 q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
-      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a
+      if [[ ${a:-$d} =~ ^[yYtT] ]]; then echo "    -> yes$([ -z "$a" ] && echo ' (default)')"; return 0; fi
+      echo "    -> no$([ -z "$a" ] && echo ' (default)')"; return 1; }
 SKIP=" ${SKIP:-} "
 # one change: interactive -> ask with the reason; otherwise apply unless the name is in SKIP
 # $1 name, $2 why, $3 what Y does, $4 what N does
 confirm() { local name=$1
-  [[ $SKIP == *" $name "* ]] && { echo "  skipped $name (SKIP)"; return 1; }
+  [[ $SKIP == *" $name "* || $SKIP == *" ${name%%-*} "* ]] && { echo "  skipped $name (SKIP)"; return 1; }
   [ -t 0 ] || return 0
   q "$name: $2" "$3" "$4" || { echo "    kept"; return 1; }; }
 WHY_gro="the NIC merges packets of a flow (GRO): the recording no longer matches the wire"
@@ -66,6 +68,11 @@ pids()  { if have pgrep; then pgrep -x $1; else ps -eo pid,comm | awk -v c=$1 '$
 nicev() { ps -o ni= -p $1 2>/dev/null | tr -d ' '; }
 oomv()  { cat $PROC/$1/oom_score_adj 2>/dev/null; }
 mlock() { awk '/Max locked memory/{print $4; exit}' $PROC/$1/limits 2>/dev/null; }
+# pinned: some thread of the process runs on fewer CPUs than are online (n2disk -c/-w/-z, taskset)
+pinned() { local on t; on=$(cat ${CPUONLINE:-/sys/devices/system/cpu/online} 2>/dev/null)
+           for t in $PROC/$1/task/*/status; do [ -r "$t" ] || continue
+             [ "$(awk '/^Cpus_allowed_list/{print $2}' $t)" != "$on" ] && return 0; done; return 1; }
+protected() { [ -f $UNITDIR/$1.d/60-capfit.conf ] && ! grep -q '^Nice=' $UNITDIR/$1.d/60-capfit.conf; }
 units() { systemctl list-units --type=service --all --plain --no-legend "$1*" 2>/dev/null | awk '{print $1}' | grep -E "^$1" ; }
 
 # ---------- check ----------
@@ -85,8 +92,10 @@ check() {
     if [ -z "$p" ]; then ok "$n" "not running" "" "-"; else
       now=$(nicev $p); [[ $now =~ ^-?[0-9]+$ ]] && [ $now -le $rec ] && v=OK || v=CHANGE; ok "$n nice (pid $p)" "$now" "<= $rec" "$v"
       now=$(oomv $p); [[ $now =~ ^-?[0-9]+$ ]] && [ $now -le $o ] && v=OK || v=CHANGE; ok "$n oom_score_adj" "$now" "<= $o" "$v"
-      now=$(mlock $p); [ "$now" = unlimited ] && v=OK || v=CHANGE; ok "$n locked memory" "$now" "unlimited" "$v"; fi
-    for u in $(units $n); do [ -f $UNITDIR/$u.d/60-capfit.conf ] && v=present || v=none; ok "  unit $u drop-in" "$v" "present" "$([ $v = present ] && echo OK || echo CHANGE)"; done
+      now=$(mlock $p); [ "$now" = unlimited ] && v=OK || v=CHANGE; ok "$n locked memory" "$now" "unlimited" "$v"
+      pinned $p && ok "$n pinned to own cores" "yes" "" "nice is safe" || ok "$n pinned to own cores" "no" "" "nice may hurt (see below)"; fi
+    for u in $(units $n); do protected $u && v=present || v=none; ok "  unit $u protection drop-in" "$v" "present" "$([ $v = present ] && echo OK || echo CHANGE)"
+      [ -f $UNITDIR/$u.d/60-capfit-nice.conf ] && v=present || v=none; ok "  unit $u nice drop-in" "$v" "optional" "-"; done
   done
   echo "boot unit (offloads after reboot): $([ -f $UNIT ] && echo yes || echo no)"
 }
@@ -124,23 +133,46 @@ kernel() {
 }
 
 priority() {
-  local a n rec o p u d
+  local a n rec o p ps u d need pin w
   for a in $APPS; do IFS=: read n rec o <<< "$a"
-    p=$(pids $n); u=$(units $n)
-    [ -z "$p$u" ] && continue
-    u=$(echo $u)
-    confirm $n "nice $rec, OOM protection $o, unlimited locked memory: the capture keeps its CPU and is the last process the kernel kills" \
-      "$([ -n "$p" ] && echo "running $n (pid $(echo $p)) changed now, " || echo "$n is not running: ")${u:+drop-in for $u used from its next start; }nothing restarts; undo: capfit.sh revert" \
-      "priority of $n unchanged" || continue
-    for p in $p; do
-      [ -f $ST/prio.$p ] || echo "$(nicev $p) $(oomv $p)" > $ST/prio.$p
-      renice -n $rec -p $p >/dev/null 2>&1; echo $o > $PROC/$p/oom_score_adj 2>/dev/null
-      have prlimit && prlimit --memlock=unlimited:unlimited --pid $p 2>/dev/null
-      echo "    $n pid $p: nice $(nicev $p), oom_score_adj $(oomv $p), locked memory $(mlock $p)"
-    done
-    for u in $u; do d=$UNITDIR/$u.d; mkdir -p $d
-      printf '%s\n' "# capfit: priority of $n (bash capfit.sh revert removes this file)" "[Service]" "Nice=$rec" "OOMScoreAdjust=$o" \
-        "LimitMEMLOCK=infinity" "LimitNOFILE=65535" > $d/60-capfit.conf; echo "    $u: drop-in $d/60-capfit.conf (used from its next start)"; done
+    ps=$(pids $n); u=$(echo $(units $n))
+    [ -z "$ps$u" ] && continue
+    # 1. protection: last to be killed when RAM runs out, buffers locked in RAM, enough open files. Safe everywhere.
+    need=0
+    for p in $ps; do [ "$(oomv $p)" -le $o ] 2>/dev/null && [ "$(mlock $p)" = unlimited ] || need=1; done
+    for d in $u; do protected $d || need=1; done
+    if [ $need = 0 ]; then echo "  $n protection: already set"
+    elif confirm $n-protect "OOM protection $o, unlimited locked memory, 65535 open files: when RAM runs out the kernel kills $n last; its buffers stay in RAM. Safe on every host" \
+        "$([ -n "$ps" ] && echo "running $n (pid $(echo $ps)) changed now, " || echo "$n is not running: ")${u:+drop-in for $u used from its next start; }nothing restarts; undo: capfit.sh revert" \
+        "$n keeps the default (killed like any other process when RAM runs out)"; then
+      for p in $ps; do [ -f $ST/prio.$p ] || echo "$(nicev $p) $(oomv $p)" > $ST/prio.$p
+        echo $o > $PROC/$p/oom_score_adj 2>/dev/null
+        have prlimit && { prlimit --memlock=unlimited:unlimited --pid $p 2>/dev/null; prlimit --nofile=65535:65535 --pid $p 2>/dev/null; }
+        echo "    $n pid $p: oom_score_adj $(oomv $p), locked memory $(mlock $p)"; done
+      for d in $u; do mkdir -p $UNITDIR/$d.d
+        printf '%s\n' "# capfit: protection of $n (bash capfit.sh revert removes this file)" "[Service]" "OOMScoreAdjust=$o" \
+          "LimitMEMLOCK=infinity" "LimitNOFILE=65535" > $UNITDIR/$d.d/60-capfit.conf; echo "    $d: drop-in $UNITDIR/$d.d/60-capfit.conf (used from its next start)"; done
+    fi
+    # 2. nice: wins CPU against other programs on the same core - also against ksoftirqd (nice 0), which receives the packets
+    need=0
+    for p in $ps; do [ "$(nicev $p)" -le $rec ] 2>/dev/null || need=1; done
+    for d in $u; do [ -f $UNITDIR/$d.d/60-capfit-nice.conf ] || need=1; done
+    [ $need = 0 ] && { echo "  $n nice: already set"; continue; }
+    pin=yes; for p in $ps; do pinned $p || pin=no; done; [ -z "$ps" ] && pin=unknown
+    case $pin in
+      yes) w="$n runs on its own cores, so this only takes CPU from other programs there: safe";;
+      no)  w="RECOMMENDED: N. $n is not pinned to its own cores: on a busy host the kernel receives packets in ksoftirqd threads (nice 0), $n at nice $rec takes their CPU and the NIC loss can RISE. Pin $n first (-c/-w/-z in n2disk.conf, see nic.sh check)";;
+      *)   w="$n is not running, pinning unknown: say Y only if $n gets its own cores (-c/-w/-z)";;
+    esac
+    if [ $pin = no ] && [ ! -t 0 ]; then echo "  skipped $n-nice ($n not pinned to own cores)"; continue; fi
+    confirm $n-nice "nice $rec: $n wins CPU against other programs on the same core. $w" \
+        "$([ -n "$ps" ] && echo "running $n (pid $(echo $ps)) gets nice $rec now, " || echo "")${u:+drop-in for $u used from its next start; }nothing restarts; undo: capfit.sh revert" \
+        "nice of $n unchanged (recommended unless $n has its own cores)" || continue
+    for p in $ps; do [ -f $ST/prio.$p ] || echo "$(nicev $p) $(oomv $p)" > $ST/prio.$p
+      renice -n $rec -p $p >/dev/null 2>&1; echo "    $n pid $p: nice $(nicev $p)"; done
+    for d in $u; do mkdir -p $UNITDIR/$d.d
+      printf '%s\n' "# capfit: nice of $n (bash capfit.sh revert removes this file)" "[Service]" "Nice=$rec" > $UNITDIR/$d.d/60-capfit-nice.conf
+      echo "    $d: drop-in $UNITDIR/$d.d/60-capfit-nice.conf (used from its next start)"; done
   done
   systemctl daemon-reload 2>/dev/null
 }
@@ -164,7 +196,7 @@ revert() {
   for f in $ST/prio.*; do [ -f "$f" ] || continue; p=${f##*.}
     if [ -d $PROC/$p ]; then read v o < $f; renice -n $v -p $p >/dev/null 2>&1; echo $o > $PROC/$p/oom_score_adj 2>/dev/null; echo "pid $p: nice $v, oom_score_adj $o again"; fi
     rm -f $f; done
-  for f in $UNITDIR/*.service.d/60-capfit.conf; do [ -f "$f" ] && rm -f "$f" && echo "removed $f" && rmdir --ignore-fail-on-non-empty "${f%/*}"; done
+  for f in $UNITDIR/*.service.d/60-capfit*.conf; do [ -f "$f" ] && rm -f "$f" && echo "removed $f" && rmdir --ignore-fail-on-non-empty "${f%/*}"; done
   [ -f $UNIT ] && { systemctl disable capfit >/dev/null 2>&1; rm -f $UNIT; echo "boot unit removed"; }
   systemctl daemon-reload 2>/dev/null
 }

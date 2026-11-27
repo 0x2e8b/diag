@@ -78,7 +78,7 @@ for i in $NICS; do
     dp=$(( P1[$i] - P0[$i] )); dm=0; [ -n "${M0[$i]}" ] && [ -n "${M1[$i]}" ] && dm=$(( M1[$i] - M0[$i] ))
     pps=$(( (dp + dm) / S )); TOTPPS=$(( TOTPPS + pps )); loss=$(pct $dm $((dp+dm)))
     echo "arriving $pps pps, received $(( dp / S )) pps, missed $(( dm / S )) pps  => NIC loss ${loss}%"
-    awk -v l=$loss 'BEGIN{exit !(l>1)}' && fnd 1 "$i loses ${loss}% of packets at the NIC (rx_missed: the host does not empty the RX ring fast enough)" "symptom: the causes are the other findings; quick help: bash nic.sh (bigger ring, IRQs on own cores)"
+    awk -v l=$loss 'BEGIN{exit !(l>1)}' && ANYLOSS=1 && fnd 1 "$i loses ${loss}% of packets at the NIC (rx_missed: the host does not empty the RX ring fast enough)" "symptom: the causes are the other findings; quick help: bash nic.sh (bigger ring, IRQs on own cores)"
     [ -z "${M0[$i]}" ] && echo "driver has no rx_missed_errors counter: NIC loss unknown"
   fi
   crc=$(cnt $i rx_crc_errors); [ -n "$crc" ] && [ "$crc" -gt 0 ] && echo "rx_crc_errors total $crc (optics/cabling, only if growing)"
@@ -202,5 +202,5 @@ if [ ${#F[@]} -eq 0 ]; then echo "nothing obvious; send the report"; else
   printf '%s\n' "${F[@]}" | sort -t'|' -k1,1n | awk -F'|' '{t=($1==1?"CRIT":($1==2?"WARN":"INFO")); printf "%2d. [%s] %s\n      fix: %s\n", NR, t, $2, $3}'
 fi
 DRV=$(basename "$(readlink $SYS/$(set -- $NICS; echo $1)/device/driver 2>/dev/null)" 2>/dev/null)
-[ $TOTPPS -gt 0 ] && echo && echo "If the findings are clean and loss stays: PF_RING ZC driver (${DRV:-NIC driver}-zc) + zbalance_ipc (one read of the NIC, n2disk and nprobe from shared memory, licence needed)."
+[ "${ANYLOSS:-0}" = 1 ] && echo && echo "If the findings are clean and loss stays: PF_RING ZC driver (${DRV:-NIC driver}-zc) + zbalance_ipc (one read of the NIC, n2disk and nprobe from shared memory, licence needed)."
 echo; echo "report: $REP"

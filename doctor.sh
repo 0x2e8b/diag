@@ -21,7 +21,9 @@ note()  { echo "${Y}NOTE${N}    $*"; }
 if [ -t 0 ]; then QM=$'\e[30;43m Q \e[0m'; RS=$'\e[1;31mLINK RESET\e[0m'; else QM=" Q "; RS="LINK RESET"; fi
 # question: $1 text, $2 what Y does, $3 what N does, $4 default y|n (n when omitted); true = yes
 q() { local a d=${4:-n}; echo; echo "$QM $1"; [ -n "${2:-}" ] && echo "    Y  $2"; [ -n "${3:-}" ] && echo "    N  $3"
-      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a; [[ ${a:-$d} =~ ^[yYtT] ]]; }
+      read -rp "    $([ $d = y ] && echo '[Y/n]' || echo '[y/N]') > " a
+      if [[ ${a:-$d} =~ ^[yYtT] ]]; then echo "    -> yes$([ -z "$a" ] && echo ' (default)')"; return 0; fi
+      echo "    -> no$([ -z "$a" ] && echo ' (default)')"; return 1; }
 sum()   { echo "$*" >> $SUM; }
 CHG=(); OPEN=()
 
@@ -277,7 +279,7 @@ fi
 NICS="$NICS" bash $HERE/capfit.sh check
 if q "Run capfit.sh?" "a separate question before EVERY change (offloads, kernel, priorities); VLAN stripping is the customer's decision" "skip, nothing changes" y; then
   NICS="$NICS" bash $HERE/capfit.sh all | tee $DST/capfit-$TS.txt
-  CF=$(grep -E '^    [^ ]' $DST/capfit-$TS.txt | grep -vE '^    (kept|Y |N |\[)' | sed 's/^ *//')
+  CF=$(grep -E '^    [^ ]' $DST/capfit-$TS.txt | grep -vE '^    (kept|Y |N |-> |\[)' | sed 's/^ *//')
   if [ -n "$CF" ]; then
     while IFS= read -r c; do CHG+=("capfit: $c"); done <<< "$CF"; CHG+=("(undo capfit: bash capfit.sh revert)")
     measure after-capfit; compare before after-capfit; rc=$?
